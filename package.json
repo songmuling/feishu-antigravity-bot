@@ -1,0 +1,24 @@
+{
+  "name": "feishu-antigravity-bot",
+  "version": "1.0.0",
+  "description": "Feishu / Lark interactive agent bridge for Google Antigravity CLI",
+  "type": "module",
+  "main": "bot.mjs",
+  "scripts": {
+    "start": "node bot.mjs"
+  },
+  "keywords": [
+    "feishu",
+    "lark",
+    "antigravity",
+    "agent",
+    "bot",
+    "llm",
+    "devops"
+  ],
+  "author": "songmuling",
+  "license": "MIT",
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.45.0"
+  }
+}

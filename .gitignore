@@ -1,0 +1,16 @@
+# 依赖库
+node_modules/
+
+# 环境变量敏感密钥配置 (绝不要提交至版本控制)
+.env
+.env.local
+.env.*.local
+
+# 运行时数据与多轮会话记录
+sessions.json
+
+# 系统日志与临时文件
+*.log
+*.bak
+.DS_Store
+Thumbs.db

@@ -1,0 +1,18 @@
+[Unit]
+Description=Feishu Antigravity Agent Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# 请修改为实际的项目绝对路径
+WorkingDirectory=/root/feishu-agent
+ExecStart=/usr/bin/node /root/feishu-agent/bot.mjs
+Restart=always
+RestartSec=5
+# 确保包含 agy 与 node 的环境变量路径
+Environment=PATH=/root/.gemini/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/root
+
+[Install]
+WantedBy=multi-user.target
