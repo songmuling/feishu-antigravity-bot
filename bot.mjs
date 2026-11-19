@@ -23,7 +23,14 @@ if (!APP_ID || !APP_SECRET) {
 const client = new lark.Client({ appId: APP_ID, appSecret: APP_SECRET });
 const wsClient = new lark.WSClient({ appId: APP_ID, appSecret: APP_SECRET, loggerLevel: lark.LoggerLevel.info });
 
-// 1. 会话读写
+// 全局任务运行状态与排队队列
+let currentTask = null; 
+// 结构: { id, child, prompt, chatId, messageId, topicTitle, statusList, isInterrupted, startedAt }
+
+const taskQueue = []; 
+// 结构: [{ id, prompt, chatId, messageId, workDir, createdAt }]
+
+// 1. 会话读写与磁盘清理
 function loadSessions() {
   try {
     if (fs.existsSync(SESSIONS_FILE)) {
@@ -43,6 +50,27 @@ function saveSessions(data) {
   }
 }
 
+// 物理彻底删除 Antigravity 在磁盘上的会话数据库与日志快照
+function purgeAntigravitySession(sessionId) {
+  if (!sessionId) return;
+  const base = '/root/.gemini/antigravity-cli';
+  const paths = [
+    path.join(base, 'conversations', `${sessionId}.db`),
+    path.join(base, 'brain', sessionId),
+    path.join(base, 'presence', `${sessionId}.lock`)
+  ];
+  for (const p of paths) {
+    try {
+      if (fs.existsSync(p)) {
+        fs.rmSync(p, { recursive: true, force: true });
+        console.log(`[Purged session on disk] ${p}`);
+      }
+    } catch (e) {
+      console.error(`清理磁盘会话文件失败 ${p}:`, e.message);
+    }
+  }
+}
+
 function timeAgo(date) {
   const seconds = Math.floor((Date.now() - date) / 1000);
   if (seconds < 60) return '刚刚';
@@ -59,7 +87,7 @@ function buildSessionListCard(sessionsData) {
   const elements = [
     {
       tag: 'markdown',
-      content: `当前共有 **${sessions.length}** 个历史主题。\n点击 **[切换]** 可无缝切回，点击 **[🗑️]** 会弹出二次确认防误触。`
+      content: `当前共有 **${sessions.length}** 个历史主题。\n点击 **[切换]** 可无缝切回，点击 **[🗑️]** 会弹出二次确认彻底删除。`
     },
     { tag: 'hr' }
   ];
@@ -101,8 +129,8 @@ function buildSessionListCard(sessionsData) {
                   text: { tag: 'plain_text', content: '🗑️' },
                   type: 'danger',
                   confirm: {
-                    title: { tag: 'plain_text', content: '确认删除当前主题？' },
-                    text: { tag: 'plain_text', content: `确定要彻底删除「${title}」吗？\n删除后历史上下文将从列表中移除。` }
+                    title: { tag: 'plain_text', content: '确认彻底删除当前主题？' },
+                    text: { tag: 'plain_text', content: `确定要彻底删除「${title}」吗？\n删除后历史上下文与底层数据将一并物理清除。` }
                   },
                   value: { action: 'delete_session', sessionId: s.id }
                 }
@@ -148,8 +176,8 @@ function buildSessionListCard(sessionsData) {
                   text: { tag: 'plain_text', content: '🗑️' },
                   type: 'danger',
                   confirm: {
-                    title: { tag: 'plain_text', content: '确认删除该主题？' },
-                    text: { tag: 'plain_text', content: `确定要彻底删除「${title}」吗？\n删除后历史上下文将从列表中移除。` }
+                    title: { tag: 'plain_text', content: '确认彻底删除该主题？' },
+                    text: { tag: 'plain_text', content: `确定要彻底删除「${title}」吗？\n删除后历史上下文与底层数据将一并物理清除。` }
                   },
                   value: { action: 'delete_session', sessionId: s.id }
                 }
@@ -258,7 +286,7 @@ function formatForFeishu(text) {
   return res;
 }
 
-// 3. 构建任务进度/结果卡片
+// 4. 构建任务进度/结果卡片
 function buildCard(title, template, prompt, statusList, resultText = '', topicTitle = '') {
   const promptDisplay = prompt.length > 100 ? prompt.slice(0, 100) + '...' : prompt;
   const elements = [
@@ -298,6 +326,64 @@ function buildCard(title, template, prompt, statusList, resultText = '', topicTi
   };
 }
 
+// 构建排队卡片 (包含打断插队与取消排队按钮)
+function buildQueueCard(runningPrompt, queuedPrompt, queuePos, queueId) {
+  const displayRunning = runningPrompt.length > 50 ? runningPrompt.slice(0, 50) + '...' : runningPrompt;
+  const displayQueued = queuedPrompt.length > 100 ? queuedPrompt.slice(0, 100) + '...' : queuedPrompt;
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'orange',
+      title: { tag: 'plain_text', content: `⏳ 任务排队中 (队列第 ${queuePos} 位)` }
+    },
+    elements: [
+      {
+        tag: 'markdown',
+        content: `**📋 你的待办指令**：\n> ${displayQueued.replace(/\n/g, '\n> ')}\n\n⚠️ **当前正忙**：正在执行【\`${displayRunning}\`】\n*排队等待中，前序任务结束后将自动开始本任务。*`
+      },
+      { tag: 'hr' },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '⚡ 立即打断插队' },
+            type: 'danger',
+            confirm: {
+              title: { tag: 'plain_text', content: '确认打断当前任务？' },
+              text: { tag: 'plain_text', content: `确定要强制停止当前正在运行的任务，立刻开始执行本条指令吗？` }
+            },
+            value: { action: 'steer_task', queueId: queueId }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '❌ 取消排队' },
+            type: 'default',
+            value: { action: 'cancel_queue', queueId: queueId }
+          }
+        ]
+      }
+    ]
+  };
+}
+
+// 构建取消排队卡片 (原文字备份一键复制区)
+function buildCancelCard(promptText) {
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'grey',
+      title: { tag: 'plain_text', content: '❌ 任务已取消排队' }
+    },
+    elements: [
+      {
+        tag: 'markdown',
+        content: `**📝 已取消的指令文本备份**（长按或点击下方代码块即可一键复制，随时粘贴回输入框重新编辑）：\n\n\`\`\`text\n${promptText}\n\`\`\`\n\n*💡 提示：在手机端长按你在上方发出的文字气泡点击「撤回」，飞书也会原生自动将文字重新放回输入框。*`
+      }
+    ]
+  };
+}
+
 async function patchCard(messageId, card) {
   try {
     const res = await client.im.v1.message.patch({
@@ -310,8 +396,53 @@ async function patchCard(messageId, card) {
   }
 }
 
-// 4. 执行 Agent 任务
-async function handleAgentExecution(chatId, prompt, workDir = '/root') {
+// 5. 任务调度执行引擎 (支持排队与打断插队)
+async function enqueueOrRun(chatId, prompt, workDir = '/root') {
+  if (currentTask) {
+    // 当前有正在执行的任务，压入队列并发送排队等待卡片
+    const queueId = 'q_' + Date.now();
+    const queuePos = taskQueue.length + 1;
+    const initialQueueCard = buildQueueCard(currentTask.prompt, prompt, queuePos, queueId);
+
+    try {
+      const msgRes = await client.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: JSON.stringify(initialQueueCard)
+        }
+      });
+      const queueMsgId = msgRes.data?.message_id;
+      taskQueue.push({
+        id: queueId,
+        chatId,
+        prompt,
+        messageId: queueMsgId,
+        workDir,
+        createdAt: Date.now()
+      });
+      console.log(`[Task Queued] "${prompt.slice(0, 20)}" pos: ${queuePos}, id: ${queueId}`);
+    } catch (e) {
+      console.error('发送排队卡片失败:', e);
+    }
+    return;
+  }
+
+  // 没有正在运行的任务，直接启动
+  await executeTask({
+    id: 't_' + Date.now(),
+    chatId,
+    prompt,
+    messageId: null,
+    workDir
+  });
+}
+
+async function executeTask(taskItem) {
+  const { chatId, prompt, workDir = '/root' } = taskItem;
+  let messageId = taskItem.messageId;
+
   console.log(`[Task Started] prompt: "${prompt}" in ${workDir}`);
 
   const sessionsData = loadSessions();
@@ -328,7 +459,7 @@ async function handleAgentExecution(chatId, prompt, workDir = '/root') {
   ];
   let finalResponse = '';
 
-  let initialCard = buildCard(
+  const initialCard = buildCard(
     isResuming ? `🟡 [接续] ${topicTitle}` : '🟡 [新主题] 正在准备...',
     'yellow',
     prompt,
@@ -337,23 +468,32 @@ async function handleAgentExecution(chatId, prompt, workDir = '/root') {
     topicTitle
   );
 
-  let msgRes;
-  try {
-    msgRes = await client.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: {
-        receive_id: chatId,
-        msg_type: 'interactive',
-        content: JSON.stringify(initialCard)
-      }
-    });
-  } catch (e) {
-    console.error('发送初始卡片失败:', e);
-    return;
+  if (messageId) {
+    // 如果之前是排队卡片，直接原地将排队卡片 Patch 转换为执行中卡片！
+    await patchCard(messageId, initialCard);
+  } else {
+    // 首次直接触发，创建新卡片
+    try {
+      const msgRes = await client.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: JSON.stringify(initialCard)
+        }
+      });
+      messageId = msgRes.data?.message_id;
+    } catch (e) {
+      console.error('发送初始卡片失败:', e);
+      checkAndRunNext();
+      return;
+    }
   }
 
-  const messageId = msgRes.data?.message_id;
-  if (!messageId) return;
+  if (!messageId) {
+    checkAndRunNext();
+    return;
+  }
 
   let lastPatchTime = 0;
   const throttledUpdate = async (immediate = false) => {
@@ -382,6 +522,19 @@ async function handleAgentExecution(chatId, prompt, workDir = '/root') {
     cwd: workDir,
     env: { ...process.env, TERM: 'xterm-256color', HOME: '/root' }
   });
+
+  // 记录为全局当前活跃任务
+  currentTask = {
+    id: taskItem.id,
+    child,
+    prompt,
+    chatId,
+    messageId,
+    topicTitle,
+    statusList,
+    isInterrupted: false,
+    startedAt: Date.now()
+  };
 
   const rl = readline.createInterface({ input: child.stdout });
   let detectedConversationId = null;
@@ -430,9 +583,19 @@ async function handleAgentExecution(chatId, prompt, workDir = '/root') {
     console.error('stderr:', data.toString());
   });
 
-  child.on('close', async (code) => {
-    console.log(`[Task Finished] code: ${code}, conversationId: ${detectedConversationId}`);
-    statusList.push(code === 0 ? '🏁 任务处理完成！' : `⚠️ 异常退出码: ${code}`);
+  child.on('close', async (code, signal) => {
+    console.log(`[Task Closed] code: ${code}, signal: ${signal}, conversationId: ${detectedConversationId}`);
+
+    const taskRef = currentTask;
+    currentTask = null;
+
+    if (taskRef && taskRef.isInterrupted) {
+      console.log(`[Task Interrupted Ignored Close] ${taskRef.id}`);
+      checkAndRunNext();
+      return;
+    }
+
+    statusList.push(code === 0 ? '🏁 任务处理完成！' : `⚠️ 异常退出码: ${code || signal}`);
 
     const finalSessionId = detectedConversationId || activeId;
     if (finalSessionId) {
@@ -463,10 +626,22 @@ async function handleAgentExecution(chatId, prompt, workDir = '/root') {
     );
 
     await patchCard(messageId, finalCard);
+
+    // 检查并调度队列中的下一个任务
+    checkAndRunNext();
   });
 }
 
-// 5. 消息路由器
+function checkAndRunNext() {
+  if (currentTask) return;
+  if (taskQueue.length > 0) {
+    const nextTask = taskQueue.shift();
+    console.log(`[Queue Dequeued] Starting next task: ${nextTask.prompt.slice(0, 25)}`);
+    executeTask(nextTask);
+  }
+}
+
+// 6. 消息路由器
 const eventDispatcher = new lark.EventDispatcher({}).register({
   'im.message.receive_v1': async (data) => {
     try {
@@ -481,7 +656,57 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
 
       console.log(`[Message Received] "${rawText}" from ${chatId}`);
 
-      // 1. 开启新主题 /new 或 /clear
+      // 1. 紧急停止 /stop 或 /kill
+      if (['/stop', '/kill', '停止', '终止', '取消当前任务'].includes(rawText.toLowerCase())) {
+        if (!currentTask && taskQueue.length === 0) {
+          await client.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'text',
+              content: JSON.stringify({ text: 'ℹ️ 当前没有正在运行或排队的任务。' })
+            }
+          });
+          return;
+        }
+
+        if (currentTask) {
+          currentTask.isInterrupted = true;
+          try {
+            currentTask.child.kill('SIGTERM');
+            setTimeout(() => {
+              try { currentTask?.child?.kill('SIGKILL'); } catch (_) {}
+            }, 1500);
+          } catch (_) {}
+
+          await patchCard(
+            currentTask.messageId,
+            buildCard('⏹️ [已手动停止] 任务已终止', 'grey', currentTask.prompt, [...currentTask.statusList, '🛑 用户发送了 /stop 终止指令'], '任务已被手动终止。', currentTask.topicTitle)
+          );
+          currentTask = null;
+        }
+
+        if (taskQueue.length > 0) {
+          for (const q of taskQueue) {
+            if (q.messageId) {
+              await patchCard(q.messageId, buildCancelCard(q.prompt));
+            }
+          }
+          taskQueue.length = 0;
+        }
+
+        await client.im.v1.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'text',
+            content: JSON.stringify({ text: `🛑 已强制终止当前任务，并已取消所有排队指令。` })
+          }
+        });
+        return;
+      }
+
+      // 2. 开启新主题 /new 或 /clear
       if (['/new', '/clear', '新建', '新建主题', '新建会话', '开启新主题'].includes(rawText.toLowerCase())) {
         const sessionsData = loadSessions();
         sessionsData.activeSessionId = null;
@@ -507,7 +732,7 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         return;
       }
 
-      // 2. 查看历史主题列表 /list
+      // 3. 查看历史主题列表 /list
       if (['/list', '/history', '历史', '会话', '主题', '会话列表', '历史主题'].includes(rawText.toLowerCase())) {
         const sessionsData = loadSessions();
         const card = buildSessionListCard(sessionsData);
@@ -522,7 +747,7 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         return;
       }
 
-      // 3. 删除主题 /del 2 或 /delete 2
+      // 4. 删除主题 /del 2 或 /delete 2 (支持磁盘物理彻底清理)
       const delMatch = rawText.match(/^\/(?:del|delete|rm)\s*(\d+)$/i) || rawText.match(/^删除\s*(\d+)$/);
       if (delMatch) {
         const targetIdx = parseInt(delMatch[1], 10) - 1;
@@ -533,6 +758,8 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
             sessionsData.activeSessionId = sessionsData.sessions[0]?.id || null;
           }
           saveSessions(sessionsData);
+          // 物理彻底清理底层数据库与脑图日志
+          purgeAntigravitySession(deleted.id);
 
           await client.im.v1.message.create({
             params: { receive_id_type: 'chat_id' },
@@ -541,11 +768,11 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
               msg_type: 'interactive',
               content: JSON.stringify({
                 config: { wide_screen_mode: true },
-                header: { template: 'red', title: { tag: 'plain_text', content: '🗑️ 主题删除成功' } },
+                header: { template: 'red', title: { tag: 'plain_text', content: '🗑️ 主题彻底删除成功' } },
                 elements: [
                   {
                     tag: 'markdown',
-                    content: `已成功删除主题：**「${deleted.title}」**\n发送 \`/list\` 可查看更新后的列表。`
+                    content: `已成功彻底删除主题：**「${deleted.title}」**（底层数据与索引已一并抹除）。\n发送 \`/list\` 可查看更新后的列表。`
                   }
                 ]
               })
@@ -565,7 +792,7 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         }
       }
 
-      // 4. 序号切换 /switch 1 或 /switch 2
+      // 5. 序号切换 /switch 1 或 /switch 2
       const switchMatch = rawText.match(/^\/(?:switch|sw|s)\s*(\d+)$/i) || rawText.match(/^切换\s*(\d+)$/);
       if (switchMatch) {
         const targetIdx = parseInt(switchMatch[1], 10) - 1;
@@ -607,23 +834,24 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         }
       }
 
-      // 5. 当前主题 /current
+      // 6. 当前主题 /current
       if (['/current', '/status', '当前', '当前主题'].includes(rawText.toLowerCase())) {
         const sessionsData = loadSessions();
         const active = sessionsData.sessions.find(s => s.id === sessionsData.activeSessionId);
         const title = active ? active.title : '未绑定特定主题（发送首条指令将自动建新主题）';
+        const busyText = currentTask ? ` (⚠️ 正忙: 执行中【${currentTask.prompt.slice(0, 15)}...】)` : ' (🟢 空闲)';
         await client.im.v1.message.create({
           params: { receive_id_type: 'chat_id' },
           data: {
             receive_id: chatId,
             msg_type: 'text',
-            content: JSON.stringify({ text: `📌 当前活跃主题:【${title}】\n发送 /list 可管理所有主题，发送 /new 可开启新主题。` })
+            content: JSON.stringify({ text: `📌 当前活跃主题:【${title}】${busyText}\n排队任务数: ${taskQueue.length} 个\n发送 /list 可管理所有主题，发送 /new 可开启新主题。` })
           }
         });
         return;
       }
 
-      // 6. 帮助 /help
+      // 7. 帮助 /help
       if (['/help', '帮助', '菜单'].includes(rawText.toLowerCase())) {
         await client.im.v1.message.create({
           params: { receive_id_type: 'chat_id' },
@@ -632,26 +860,27 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
             msg_type: 'text',
             content: JSON.stringify({ 
               text: `🤖 飞书 Agent 指令指南：\n\n` +
-                    `• /list   : 查看全部历史主题，点击切换或删除\n` +
+                    `• /list   : 查看全部历史主题，点击切换或彻底删除\n` +
                     `• /switch <序号> : 切换到指定主题 (如 /switch 2)\n` +
-                    `• /del <序号>    : 删除指定历史主题 (如 /del 3)\n` +
+                    `• /del <序号>    : 彻底删除指定主题 (连同底层数据)\n` +
                     `• /new    : 开启全新主题，清空上下文\n` +
-                    `• /current: 查看当前所在主题\n` +
-                    `• 直接发文字 : 默认在当前主题下多轮连续对话`
+                    `• /stop   : 紧急终止当前任务并清空排队\n` +
+                    `• /current: 查看当前所在主题与运行状态\n` +
+                    `• 直接发文字 : 默认执行指令（若正忙会自动排队，支持随时插队）`
             })
           }
         });
         return;
       }
 
-      // 默认指令执行
-      handleAgentExecution(chatId, rawText);
+      // 默认指令执行 (入队或立即执行)
+      enqueueOrRun(chatId, rawText);
     } catch (err) {
       console.error('处理消息失败:', err);
     }
   },
 
-  // 卡片点击事件监听（包含二次确认后的删除回调）
+  // 卡片点击事件监听（包含二次确认后的删除回调、打断插队、取消排队）
   'card.action.trigger': async (data) => {
     try {
       const action = data.action;
@@ -662,6 +891,62 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
       const sessionsData = loadSessions();
       let toastMsg = '操作完成';
 
+      // 1. 打断插队
+      if (value?.action === 'steer_task') {
+        const queueIdx = taskQueue.findIndex(q => q.id === value.queueId);
+        if (queueIdx === -1) {
+          return { toast: { type: 'warning', content: '该排队任务已开始执行或已取消' } };
+        }
+        const targetTask = taskQueue.splice(queueIdx, 1)[0];
+
+        // 打断当前正在运行的任务
+        if (currentTask) {
+          currentTask.isInterrupted = true;
+          try {
+            currentTask.child.kill('SIGTERM');
+            setTimeout(() => {
+              try { currentTask?.child?.kill('SIGKILL'); } catch (_) {}
+            }, 1500);
+          } catch (_) {}
+
+          await patchCard(
+            currentTask.messageId,
+            buildCard('⚠️ [已打断] 任务被新指令插队', 'grey', currentTask.prompt, [...currentTask.statusList, '⚡ 用户点击插队，此任务已终止'], '此任务已被新任务插队打断，未执行后续步骤。', currentTask.topicTitle)
+          );
+          currentTask = null;
+        }
+
+        // 立刻启动这个插队的任务 (它的 messageId 会被直接转换为执行卡片)
+        executeTask(targetTask);
+
+        return {
+          toast: {
+            type: 'success',
+            content: '⚡ 插队成功！已终止前序任务，立刻开始执行！'
+          }
+        };
+      }
+
+      // 2. 取消排队 (保留文字备份)
+      if (value?.action === 'cancel_queue') {
+        const queueIdx = taskQueue.findIndex(q => q.id === value.queueId);
+        let cancelledPrompt = '';
+        if (queueIdx !== -1) {
+          const removed = taskQueue.splice(queueIdx, 1)[0];
+          cancelledPrompt = removed.prompt;
+        }
+        if (msgId) {
+          await patchCard(msgId, buildCancelCard(cancelledPrompt || '已取消的任务'));
+        }
+        return {
+          toast: {
+            type: 'info',
+            content: '已取消排队，指令文本已在卡片中备份'
+          }
+        };
+      }
+
+      // 3. 切换主题
       if (value?.action === 'switch_session') {
         const target = sessionsData.sessions.find(s => s.id === value.sessionId);
         if (target) {
@@ -670,7 +955,9 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
           saveSessions(sessionsData);
           toastMsg = `已切换到：「${target.title.slice(0, 10)}」`;
         }
-      } else if (value?.action === 'delete_session') {
+      } 
+      // 4. 彻底删除主题 (连同底层物理文件)
+      else if (value?.action === 'delete_session') {
         const targetIdx = sessionsData.sessions.findIndex(s => s.id === value.sessionId);
         if (targetIdx !== -1) {
           const deleted = sessionsData.sessions.splice(targetIdx, 1)[0];
@@ -678,21 +965,24 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
             sessionsData.activeSessionId = sessionsData.sessions[0]?.id || null;
           }
           saveSessions(sessionsData);
-          toastMsg = `已删除：「${deleted.title.slice(0, 10)}」`;
+          // 物理彻底删除底层数据库与 brain 目录
+          purgeAntigravitySession(deleted.id);
+          toastMsg = `已彻底删除：「${deleted.title.slice(0, 10)}」`;
         }
-      } else if (value?.action === 'new_session') {
+      } 
+      // 5. 开启新主题
+      else if (value?.action === 'new_session') {
         sessionsData.activeSessionId = null;
         saveSessions(sessionsData);
         toastMsg = '已就绪，下条指令建新主题';
       }
 
-      // 1. 显式主动 Patch 卡片，彻底更新卡片界面
+      // 显式主动 Patch 更新卡片
       const updatedCard = buildSessionListCard(sessionsData);
       if (msgId) {
         await patchCard(msgId, updatedCard);
       }
 
-      // 2. 返回飞书标准回调 ACK
       return {
         toast: {
           type: 'success',
@@ -715,5 +1005,5 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
   }
 });
 
-console.log('🚀 正在启动支持【原生二次确认删除】的飞书 Agent 机器人服务...');
+console.log('🚀 正在启动支持【排队/打断插队/物理彻底删除】的飞书 Agent 机器人服务...');
 wsClient.start({ eventDispatcher });
