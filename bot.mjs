@@ -30,6 +30,8 @@ let currentTask = null;
 const taskQueue = []; 
 // 结构: [{ id, prompt, chatId, messageId, workDir, createdAt }]
 
+const queuePromptMap = new Map(); // 永久保存 queueId -> prompt 映射，防止多次点击导致文本丢失
+
 // 1. 会话读写与磁盘清理
 function loadSessions() {
   try {
@@ -378,7 +380,19 @@ function buildCancelCard(promptText) {
     elements: [
       {
         tag: 'markdown',
-        content: `**📝 已取消的指令文本备份**（长按或点击下方代码块即可一键复制，随时粘贴回输入框重新编辑）：\n\n\`\`\`text\n${promptText}\n\`\`\`\n\n*💡 提示：在手机端长按你在上方发出的文字气泡点击「撤回」，飞书也会原生自动将文字重新放回输入框。*`
+        content: `**📝 已取消的指令文本**：\n\n\`\`\`text\n${promptText || '未记录到文本'}\n\`\`\`\n\n*💡 提示：在上方聊天记录中长按你自己发出的「文字气泡」点击「撤回」，飞书也会原生自动将文字重新放回输入框；或直接点击下方按钮一键重发。*`
+      },
+      { tag: 'hr' },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🚀 一键重新执行此指令' },
+            type: 'primary',
+            value: { action: 'retry_prompt', prompt: promptText }
+          }
+        ]
       }
     ]
   };
@@ -401,6 +415,7 @@ async function enqueueOrRun(chatId, prompt, workDir = '/root') {
   if (currentTask) {
     // 当前有正在执行的任务，压入队列并发送排队等待卡片
     const queueId = 'q_' + Date.now();
+    queuePromptMap.set(queueId, prompt);
     const queuePos = taskQueue.length + 1;
     const initialQueueCard = buildQueueCard(currentTask.prompt, prompt, queuePos, queueId);
 
@@ -916,13 +931,26 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
           currentTask = null;
         }
 
-        // 立刻启动这个插队的任务 (它的 messageId 会被直接转换为执行卡片)
+        // 立即启动这个插队的任务
         executeTask(targetTask);
+
+        const progressCard = buildCard(
+          `🟡 [插队执行] 正在启动...`,
+          'yellow',
+          targetTask.prompt,
+          ['⚡ 已打断前序任务，新指令立刻启动！'],
+          '',
+          targetTask.prompt.slice(0, 20)
+        );
 
         return {
           toast: {
             type: 'success',
             content: '⚡ 插队成功！已终止前序任务，立刻开始执行！'
+          },
+          card: {
+            type: 'raw',
+            data: progressCard
           }
         };
       }
@@ -930,18 +958,41 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
       // 2. 取消排队 (保留文字备份)
       if (value?.action === 'cancel_queue') {
         const queueIdx = taskQueue.findIndex(q => q.id === value.queueId);
-        let cancelledPrompt = '';
+        let cancelledPrompt = queuePromptMap.get(value.queueId) || '';
         if (queueIdx !== -1) {
           const removed = taskQueue.splice(queueIdx, 1)[0];
-          cancelledPrompt = removed.prompt;
+          if (!cancelledPrompt) cancelledPrompt = removed.prompt;
         }
+
+        const cancelCard = buildCancelCard(cancelledPrompt || '已取消的任务');
         if (msgId) {
-          await patchCard(msgId, buildCancelCard(cancelledPrompt || '已取消的任务'));
+          await patchCard(msgId, cancelCard);
         }
+
+        // 核心修复：必须在回调 ACK 中显式返回卡片数据，否则飞书客户端会回滚到本地卡片缓存！
         return {
           toast: {
             type: 'info',
             content: '已取消排队，指令文本已在卡片中备份'
+          },
+          card: {
+            type: 'raw',
+            data: cancelCard
+          }
+        };
+      }
+
+      // 3. 一键重新执行此指令
+      if (value?.action === 'retry_prompt') {
+        const retryPrompt = value.prompt;
+        const targetChatId = data.open_chat_id || data.context?.open_chat_id;
+        if (retryPrompt) {
+          enqueueOrRun(targetChatId || data.chat_id, retryPrompt);
+        }
+        return {
+          toast: {
+            type: 'success',
+            content: '🚀 已重新提交任务！'
           }
         };
       }
