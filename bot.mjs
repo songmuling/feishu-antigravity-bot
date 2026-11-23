@@ -14,6 +14,10 @@ const APP_ID = process.env.FEISHU_APP_ID || '';
 const APP_SECRET = process.env.FEISHU_APP_SECRET || '';
 const SESSIONS_FILE = process.env.SESSIONS_FILE || path.resolve(process.cwd(), 'sessions.json');
 const AGY_BIN = process.env.AGY_BIN || '/root/.gemini/bin/agy';
+const TMP_DIR = process.env.TMP_DIR || path.resolve(process.env.HOME || '/root', 'feishu-agent/tmp');
+if (!fs.existsSync(TMP_DIR)) {
+  fs.mkdirSync(TMP_DIR, { recursive: true });
+}
 
 if (!APP_ID || !APP_SECRET) {
   console.error('❌ 错误: 未检测到 FEISHU_APP_ID 或 FEISHU_APP_SECRET，请在 .env 文件中配置！');
@@ -444,13 +448,44 @@ function terminateTask(taskToKill) {
   }
 }
 
-async function enqueueOrRun(chatId, prompt, workDir = '/root') {
+// 下载飞书消息内的图片资源并保存到本地
+async function downloadMessageImages(messageId, imageKeys, tmpDir) {
+  const downloadedPaths = [];
+  for (let i = 0; i < imageKeys.length; i++) {
+    const key = imageKeys[i];
+    const safeKey = key.replace(/[^a-zA-Z0-9_-]/g, '').slice(-16);
+    const fileName = `img_${Date.now()}_${i + 1}_${safeKey}.png`;
+    const localPath = path.join(tmpDir, fileName);
+
+    try {
+      console.log(`[Downloading Image] messageId: ${messageId}, key: ${key} -> ${localPath}`);
+      const fileRes = await client.im.v1.messageResource.get({
+        path: {
+          message_id: messageId,
+          file_key: key
+        },
+        params: {
+          type: 'image'
+        }
+      });
+      await fileRes.writeFile(localPath);
+      downloadedPaths.push(localPath);
+      console.log(`[Image Downloaded] ${localPath}`);
+    } catch (err) {
+      console.error(`[Download Image Failed] key ${key}:`, err.message || err);
+    }
+  }
+  return downloadedPaths;
+}
+
+async function enqueueOrRun(chatId, prompt, workDir = '/root', displayPrompt = null) {
+  const textForCard = displayPrompt || prompt;
   if (currentTask) {
     // 当前有正在执行的任务，压入队列并发送排队等待卡片
     const queueId = 'q_' + Date.now();
-    queuePromptMap.set(queueId, prompt);
+    queuePromptMap.set(queueId, textForCard);
     const queuePos = taskQueue.length + 1;
-    const initialQueueCard = buildQueueCard(currentTask.prompt, prompt, queuePos, queueId);
+    const initialQueueCard = buildQueueCard(currentTask.displayPrompt || currentTask.prompt, textForCard, queuePos, queueId);
 
     try {
       const msgRes = await client.im.v1.message.create({
@@ -466,11 +501,12 @@ async function enqueueOrRun(chatId, prompt, workDir = '/root') {
         id: queueId,
         chatId,
         prompt,
+        displayPrompt: textForCard,
         messageId: queueMsgId,
         workDir,
         createdAt: Date.now()
       });
-      console.log(`[Task Queued] "${prompt.slice(0, 20)}" pos: ${queuePos}, id: ${queueId}`);
+      console.log(`[Task Queued] "${textForCard.slice(0, 20)}" pos: ${queuePos}, id: ${queueId}`);
     } catch (e) {
       console.error('发送排队卡片失败:', e);
     }
@@ -482,23 +518,24 @@ async function enqueueOrRun(chatId, prompt, workDir = '/root') {
     id: 't_' + Date.now(),
     chatId,
     prompt,
+    displayPrompt: textForCard,
     messageId: null,
     workDir
   });
 }
 
 async function executeTask(taskItem) {
-  const { chatId, prompt, workDir = '/root' } = taskItem;
+  const { chatId, prompt, displayPrompt = prompt, workDir = '/root' } = taskItem;
   let messageId = taskItem.messageId;
 
-  console.log(`[Task Started] prompt: "${prompt}" in ${workDir}`);
+  console.log(`[Task Started] prompt: "${displayPrompt.slice(0, 30)}" in ${workDir}`);
 
   const sessionsData = loadSessions();
   const isResuming = !!sessionsData.activeSessionId;
   const activeId = sessionsData.activeSessionId;
   
   let currentSession = sessionsData.sessions.find(s => s.id === activeId);
-  let topicTitle = currentSession ? currentSession.title : prompt.slice(0, 25);
+  let topicTitle = currentSession ? currentSession.title : displayPrompt.slice(0, 25);
 
   const statusList = [
     isResuming 
@@ -510,7 +547,7 @@ async function executeTask(taskItem) {
   const initialCard = buildCard(
     isResuming ? `🟡 [接续] ${topicTitle}` : '🟡 [新主题] 正在准备...',
     'yellow',
-    prompt,
+    displayPrompt,
     statusList,
     '',
     topicTitle
@@ -559,6 +596,7 @@ async function executeTask(taskItem) {
     id: taskItem.id,
     child,
     prompt,
+    displayPrompt,
     chatId,
     messageId,
     topicTitle,
@@ -577,7 +615,7 @@ async function executeTask(taskItem) {
       const card = buildCard(
         `🟡 [${topicTitle}] 执行中...`,
         'yellow',
-        prompt,
+        displayPrompt,
         statusList,
         finalResponse,
         topicTitle
@@ -664,7 +702,7 @@ async function executeTask(taskItem) {
       } else {
         sessionsData.sessions.unshift({
           id: finalSessionId,
-          title: prompt.slice(0, 30),
+          title: displayPrompt.slice(0, 30),
           createdAt: Date.now(),
           updatedAt: Date.now(),
           turnCount: 1
@@ -676,7 +714,7 @@ async function executeTask(taskItem) {
     const finalCard = buildCard(
       code === 0 ? `🟢 [${topicTitle}] 成功完成` : '❌ 任务执行异常',
       code === 0 ? 'green' : 'red',
-      prompt,
+      displayPrompt,
       statusList,
       finalResponse || (code === 0 ? '任务已执行，无额外文本回复。' : '执行遇到异常，请检查配置。'),
       topicTitle
@@ -703,156 +741,118 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
   'im.message.receive_v1': async (data) => {
     try {
       const message = data.message;
-      if (message.message_type !== 'text') return;
+      if (!message) return;
 
-      const content = JSON.parse(message.content);
-      const rawText = content.text?.trim() || '';
+      const messageType = message.message_type;
+      const messageId = message.message_id;
       const chatId = message.chat_id;
 
-      if (!rawText) return;
+      let rawText = '';
+      const imageKeys = [];
 
-      console.log(`[Message Received] "${rawText}" from ${chatId}`);
+      if (messageType === 'text') {
+        const content = JSON.parse(message.content);
+        rawText = content.text?.trim() || '';
+      } else if (messageType === 'image') {
+        const content = JSON.parse(message.content);
+        if (content.image_key) {
+          imageKeys.push(content.image_key);
+        }
+      } else if (messageType === 'post') {
+        const content = JSON.parse(message.content);
+        let postObj = content;
+        if (content.zh_cn) postObj = content.zh_cn;
+        else if (content.en_us) postObj = content.en_us;
+        else if (content.ja_jp) postObj = content.ja_jp;
+        else {
+          const firstLocale = Object.keys(content).find(k => content[k]?.content);
+          if (firstLocale) postObj = content[firstLocale];
+        }
 
-      // 1. 紧急停止 /stop 或 /kill
-      if (['/stop', '/kill', '停止', '终止', '取消当前任务'].includes(rawText.toLowerCase())) {
-        if (!currentTask && taskQueue.length === 0) {
+        const title = postObj?.title?.trim() || '';
+        const lines = [];
+        if (title) lines.push(title);
+
+        const paragraphs = postObj?.content || [];
+        for (const p of paragraphs) {
+          if (!Array.isArray(p)) continue;
+          let pText = '';
+          for (const el of p) {
+            if (el.tag === 'text') {
+              pText += el.text || '';
+            } else if (el.tag === 'a') {
+              pText += el.text || el.href || '';
+            } else if (el.tag === 'at') {
+              pText += `@${el.user_name || '用户'}`;
+            } else if (el.tag === 'img' && el.image_key) {
+              imageKeys.push(el.image_key);
+            }
+          }
+          if (pText.trim()) {
+            lines.push(pText.trim());
+          }
+        }
+        rawText = lines.join('\n').trim();
+      } else {
+        console.log(`[Ignored Message Type] ${messageType}`);
+        return;
+      }
+
+      console.log(`[Message Received] type: ${messageType}, text: "${rawText.slice(0, 30)}", images: ${imageKeys.length} from ${chatId}`);
+
+      if (!rawText && imageKeys.length === 0) return;
+
+      // 仅当没有图片且为特定命令时，触发快捷命令路由
+      if (imageKeys.length === 0) {
+        // 1. 紧急停止 /stop 或 /kill
+        if (['/stop', '/kill', '停止', '终止', '取消当前任务'].includes(rawText.toLowerCase())) {
+          if (!currentTask && taskQueue.length === 0) {
+            await client.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: {
+                receive_id: chatId,
+                msg_type: 'text',
+                content: JSON.stringify({ text: 'ℹ️ 当前没有正在运行或排队的任务。' })
+              }
+            });
+            return;
+          }
+
+          if (currentTask) {
+            const taskToStop = currentTask;
+            currentTask = null;
+            terminateTask(taskToStop);
+
+            await patchCard(
+              taskToStop.messageId,
+              buildCard('⏹️ [已手动停止] 任务已终止', 'grey', taskToStop.displayPrompt || taskToStop.prompt, [...taskToStop.statusList, '🛑 用户发送了 /stop 终止指令'], '任务已被手动终止。', taskToStop.topicTitle)
+            );
+          }
+
+          if (taskQueue.length > 0) {
+            for (const q of taskQueue) {
+              if (q.messageId) {
+                await patchCard(q.messageId, buildCancelCard(q.prompt));
+              }
+            }
+            taskQueue.length = 0;
+          }
+
           await client.im.v1.message.create({
             params: { receive_id_type: 'chat_id' },
             data: {
               receive_id: chatId,
               msg_type: 'text',
-              content: JSON.stringify({ text: 'ℹ️ 当前没有正在运行或排队的任务。' })
+              content: JSON.stringify({ text: `🛑 已强制终止当前任务，并已取消所有排队指令。` })
             }
           });
           return;
         }
 
-        if (currentTask) {
-          const taskToStop = currentTask;
-          currentTask = null;
-          terminateTask(taskToStop);
-
-          await patchCard(
-            taskToStop.messageId,
-            buildCard('⏹️ [已手动停止] 任务已终止', 'grey', taskToStop.prompt, [...taskToStop.statusList, '🛑 用户发送了 /stop 终止指令'], '任务已被手动终止。', taskToStop.topicTitle)
-          );
-        }
-
-        if (taskQueue.length > 0) {
-          for (const q of taskQueue) {
-            if (q.messageId) {
-              await patchCard(q.messageId, buildCancelCard(q.prompt));
-            }
-          }
-          taskQueue.length = 0;
-        }
-
-        await client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'text',
-            content: JSON.stringify({ text: `🛑 已强制终止当前任务，并已取消所有排队指令。` })
-          }
-        });
-        return;
-      }
-
-      // 2. 开启新主题 /new 或 /clear
-      if (['/new', '/clear', '新建', '新建主题', '新建会话', '开启新主题'].includes(rawText.toLowerCase())) {
-        const sessionsData = loadSessions();
-        sessionsData.activeSessionId = null;
-        saveSessions(sessionsData);
-
-        await client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'interactive',
-            content: JSON.stringify({
-              config: { wide_screen_mode: true },
-              header: { template: 'green', title: { tag: 'plain_text', content: '✨ 已开启全新主题' } },
-              elements: [
-                {
-                  tag: 'markdown',
-                  content: '历史上下文已安全封存。\n\n**你的下一条消息将作为新主题的开端**，随时可以开始下发新任务！'
-                }
-              ]
-            })
-          }
-        });
-        return;
-      }
-
-      // 3. 查看历史主题列表 /list
-      if (['/list', '/history', '历史', '会话', '主题', '会话列表', '历史主题'].includes(rawText.toLowerCase())) {
-        const sessionsData = loadSessions();
-        const card = buildSessionListCard(sessionsData);
-        await client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'interactive',
-            content: JSON.stringify(card)
-          }
-        });
-        return;
-      }
-
-      // 4. 删除主题 /del 2 或 /delete 2 (支持磁盘物理彻底清理)
-      const delMatch = rawText.match(/^\/(?:del|delete|rm)\s*(\d+)$/i) || rawText.match(/^删除\s*(\d+)$/);
-      if (delMatch) {
-        const targetIdx = parseInt(delMatch[1], 10) - 1;
-        const sessionsData = loadSessions();
-        if (targetIdx >= 0 && targetIdx < sessionsData.sessions.length) {
-          const deleted = sessionsData.sessions.splice(targetIdx, 1)[0];
-          if (sessionsData.activeSessionId === deleted.id) {
-            sessionsData.activeSessionId = sessionsData.sessions[0]?.id || null;
-          }
-          saveSessions(sessionsData);
-          // 物理彻底清理底层数据库与脑图日志
-          purgeAntigravitySession(deleted.id);
-
-          await client.im.v1.message.create({
-            params: { receive_id_type: 'chat_id' },
-            data: {
-              receive_id: chatId,
-              msg_type: 'interactive',
-              content: JSON.stringify({
-                config: { wide_screen_mode: true },
-                header: { template: 'red', title: { tag: 'plain_text', content: '🗑️ 主题彻底删除成功' } },
-                elements: [
-                  {
-                    tag: 'markdown',
-                    content: `已成功彻底删除主题：**「${deleted.title}」**（底层数据与索引已一并抹除）。\n发送 \`/list\` 可查看更新后的列表。`
-                  }
-                ]
-              })
-            }
-          });
-          return;
-        } else {
-          await client.im.v1.message.create({
-            params: { receive_id_type: 'chat_id' },
-            data: {
-              receive_id: chatId,
-              msg_type: 'text',
-              content: JSON.stringify({ text: `❌ 序号无效，请输入 1 ~ ${sessionsData.sessions.length} 之间的有效序号（发送 /list 查看列表）` })
-            }
-          });
-          return;
-        }
-      }
-
-      // 5. 序号切换 /switch 1 或 /switch 2
-      const switchMatch = rawText.match(/^\/(?:switch|sw|s)\s*(\d+)$/i) || rawText.match(/^切换\s*(\d+)$/);
-      if (switchMatch) {
-        const targetIdx = parseInt(switchMatch[1], 10) - 1;
-        const sessionsData = loadSessions();
-        if (targetIdx >= 0 && targetIdx < sessionsData.sessions.length) {
-          const target = sessionsData.sessions[targetIdx];
-          sessionsData.activeSessionId = target.id;
-          target.updatedAt = Date.now();
+        // 2. 开启新主题 /new 或 /clear
+        if (['/new', '/clear', '新建', '新建主题', '新建会话', '开启新主题'].includes(rawText.toLowerCase())) {
+          const sessionsData = loadSessions();
+          sessionsData.activeSessionId = null;
           saveSessions(sessionsData);
 
           await client.im.v1.message.create({
@@ -862,71 +862,190 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
               msg_type: 'interactive',
               content: JSON.stringify({
                 config: { wide_screen_mode: true },
-                header: { template: 'blue', title: { tag: 'plain_text', content: '🔀 会话主题切换成功' } },
+                header: { template: 'green', title: { tag: 'plain_text', content: '✨ 已开启全新主题' } },
                 elements: [
                   {
                     tag: 'markdown',
-                    content: `已成功切换到主题：**「${target.title}」**\n*当前历史已无缝挂载，你可以直接继续向它追问！*`
+                    content: '历史上下文已安全封存。\n\n**你的下一条消息将作为新主题的开端**，随时可以开始下发新任务！'
                   }
                 ]
               })
             }
           });
           return;
-        } else {
+        }
+
+        // 3. 查看历史主题列表 /list
+        if (['/list', '/history', '历史', '会话', '主题', '会话列表', '历史主题'].includes(rawText.toLowerCase())) {
+          const sessionsData = loadSessions();
+          const card = buildSessionListCard(sessionsData);
+          await client.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'interactive',
+              content: JSON.stringify(card)
+            }
+          });
+          return;
+        }
+
+        // 4. 删除主题 /del 2 或 /delete 2 (支持磁盘物理彻底清理)
+        const delMatch = rawText.match(/^\/(?:del|delete|rm)\s*(\d+)$/i) || rawText.match(/^删除\s*(\d+)$/);
+        if (delMatch) {
+          const targetIdx = parseInt(delMatch[1], 10) - 1;
+          const sessionsData = loadSessions();
+          if (targetIdx >= 0 && targetIdx < sessionsData.sessions.length) {
+            const deleted = sessionsData.sessions.splice(targetIdx, 1)[0];
+            if (sessionsData.activeSessionId === deleted.id) {
+              sessionsData.activeSessionId = sessionsData.sessions[0]?.id || null;
+            }
+            saveSessions(sessionsData);
+            // 物理彻底清理底层数据库与脑图日志
+            purgeAntigravitySession(deleted.id);
+
+            await client.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: {
+                receive_id: chatId,
+                msg_type: 'interactive',
+                content: JSON.stringify({
+                  config: { wide_screen_mode: true },
+                  header: { template: 'red', title: { tag: 'plain_text', content: '🗑️ 主题彻底删除成功' } },
+                  elements: [
+                    {
+                      tag: 'markdown',
+                      content: `已成功彻底删除主题：**「${deleted.title}」**（底层数据与索引已一并抹除）。\n发送 \`/list\` 可查看更新后的列表。`
+                    }
+                  ]
+                })
+              }
+            });
+            return;
+          } else {
+            await client.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: {
+                receive_id: chatId,
+                msg_type: 'text',
+                content: JSON.stringify({ text: `❌ 序号无效，请输入 1 ~ ${sessionsData.sessions.length} 之间的有效序号（发送 /list 查看列表）` })
+              }
+            });
+            return;
+          }
+        }
+
+        // 5. 序号切换 /switch 1 或 /switch 2
+        const switchMatch = rawText.match(/^\/(?:switch|sw|s)\s*(\d+)$/i) || rawText.match(/^切换\s*(\d+)$/);
+        if (switchMatch) {
+          const targetIdx = parseInt(switchMatch[1], 10) - 1;
+          const sessionsData = loadSessions();
+          if (targetIdx >= 0 && targetIdx < sessionsData.sessions.length) {
+            const target = sessionsData.sessions[targetIdx];
+            sessionsData.activeSessionId = target.id;
+            target.updatedAt = Date.now();
+            saveSessions(sessionsData);
+
+            await client.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: {
+                receive_id: chatId,
+                msg_type: 'interactive',
+                content: JSON.stringify({
+                  config: { wide_screen_mode: true },
+                  header: { template: 'blue', title: { tag: 'plain_text', content: '🔀 会话主题切换成功' } },
+                  elements: [
+                    {
+                      tag: 'markdown',
+                      content: `已成功切换到主题：**「${target.title}」**\n*当前历史已无缝挂载，你可以直接继续向它追问！*`
+                    }
+                  ]
+                })
+              }
+            });
+            return;
+          } else {
+            await client.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: {
+                receive_id: chatId,
+                msg_type: 'text',
+                content: JSON.stringify({ text: `❌ 序号无效，请输入 1 ~ ${sessionsData.sessions.length} 之间的有效序号（发送 /list 查看列表）` })
+              }
+            });
+            return;
+          }
+        }
+
+        // 6. 当前主题 /current
+        if (['/current', '/status', '当前', '当前主题'].includes(rawText.toLowerCase())) {
+          const sessionsData = loadSessions();
+          const active = sessionsData.sessions.find(s => s.id === sessionsData.activeSessionId);
+          const title = active ? active.title : '未绑定特定主题（发送首条指令将自动建新主题）';
+          const busyText = currentTask ? ` (⚠️ 正忙: 执行中【${(currentTask.displayPrompt || currentTask.prompt).slice(0, 15)}...】)` : ' (🟢 空闲)';
           await client.im.v1.message.create({
             params: { receive_id_type: 'chat_id' },
             data: {
               receive_id: chatId,
               msg_type: 'text',
-              content: JSON.stringify({ text: `❌ 序号无效，请输入 1 ~ ${sessionsData.sessions.length} 之间的有效序号（发送 /list 查看列表）` })
+              content: JSON.stringify({ text: `📌 当前活跃主题:【${title}】${busyText}\n排队任务数: ${taskQueue.length} 个\n发送 /list 可管理所有主题，发送 /new 可开启新主题。` })
+            }
+          });
+          return;
+        }
+
+        // 7. 帮助 /help
+        if (['/help', '帮助', '菜单'].includes(rawText.toLowerCase())) {
+          await client.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'text',
+              content: JSON.stringify({ 
+                text: `🤖 飞书 Agent 指令指南：\n\n` +
+                      `• /list   : 查看全部历史主题，点击切换或彻底删除\n` +
+                      `• /switch <序号> : 切换到指定主题 (如 /switch 2)\n` +
+                      `• /del <序号>    : 彻底删除指定主题 (连同底层数据)\n` +
+                      `• /new    : 开启全新主题，清空上下文\n` +
+                      `• /stop   : 紧急终止当前任务并清空排队\n` +
+                      `• /current: 查看当前所在主题与运行状态\n` +
+                      `• 直接发文字/图片 : 默认执行指令（支持多模态识图，若正忙会自动排队）`
+              })
             }
           });
           return;
         }
       }
 
-      // 6. 当前主题 /current
-      if (['/current', '/status', '当前', '当前主题'].includes(rawText.toLowerCase())) {
-        const sessionsData = loadSessions();
-        const active = sessionsData.sessions.find(s => s.id === sessionsData.activeSessionId);
-        const title = active ? active.title : '未绑定特定主题（发送首条指令将自动建新主题）';
-        const busyText = currentTask ? ` (⚠️ 正忙: 执行中【${currentTask.prompt.slice(0, 15)}...】)` : ' (🟢 空闲)';
-        await client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'text',
-            content: JSON.stringify({ text: `📌 当前活跃主题:【${title}】${busyText}\n排队任务数: ${taskQueue.length} 个\n发送 /list 可管理所有主题，发送 /new 可开启新主题。` })
+      // 默认指令执行 (包含下载图片与多模态组装)
+      let finalPrompt = rawText;
+      let displayPrompt = rawText;
+
+      if (imageKeys.length > 0) {
+        const savedPaths = await downloadMessageImages(messageId, imageKeys, TMP_DIR);
+        if (savedPaths.length > 0) {
+          const imgNotice = savedPaths.map((p, idx) => `【图片 ${idx + 1} 本地路径】: ${p}`).join('\n');
+          if (finalPrompt) {
+            finalPrompt = `${imgNotice}\n\n用户附带了上述图片并提问：\n${finalPrompt}\n\n请使用 read_file 或相关多模态分析能力查看本地图片，并结合用户的问题进行分析与解答。`;
+            displayPrompt = `🖼️ [附图 ${savedPaths.length} 张] ${displayPrompt}`;
+          } else {
+            finalPrompt = `${imgNotice}\n\n用户上传了上述图片，请使用 read_file 查看并分析该图片的内容，给出详细解析。`;
+            displayPrompt = `🖼️ [附图 ${savedPaths.length} 张]`;
           }
-        });
-        return;
+        } else if (!finalPrompt) {
+          await client.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'text',
+              content: JSON.stringify({ text: '⚠️ 图片下载失败，请检查飞书开放平台是否已授予应用「读取消息中的资源文件」权限。' })
+            }
+          });
+          return;
+        }
       }
 
-      // 7. 帮助 /help
-      if (['/help', '帮助', '菜单'].includes(rawText.toLowerCase())) {
-        await client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'text',
-            content: JSON.stringify({ 
-              text: `🤖 飞书 Agent 指令指南：\n\n` +
-                    `• /list   : 查看全部历史主题，点击切换或彻底删除\n` +
-                    `• /switch <序号> : 切换到指定主题 (如 /switch 2)\n` +
-                    `• /del <序号>    : 彻底删除指定主题 (连同底层数据)\n` +
-                    `• /new    : 开启全新主题，清空上下文\n` +
-                    `• /stop   : 紧急终止当前任务并清空排队\n` +
-                    `• /current: 查看当前所在主题与运行状态\n` +
-                    `• 直接发文字 : 默认执行指令（若正忙会自动排队，支持随时插队）`
-            })
-          }
-        });
-        return;
-      }
-
-      // 默认指令执行 (入队或立即执行)
-      enqueueOrRun(chatId, rawText);
+      enqueueOrRun(chatId, finalPrompt, '/root', displayPrompt);
     } catch (err) {
       console.error('处理消息失败:', err);
     }
@@ -959,7 +1078,7 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
 
           await patchCard(
             interruptedTask.messageId,
-            buildCard('⚠️ [已打断] 任务被新指令插队', 'grey', interruptedTask.prompt, [...interruptedTask.statusList, '⚡ 用户点击插队，此任务已终止'], '此任务已被新任务插队打断，未执行后续步骤。', interruptedTask.topicTitle)
+            buildCard('⚠️ [已打断] 任务被新指令插队', 'grey', interruptedTask.displayPrompt || interruptedTask.prompt, [...interruptedTask.statusList, '⚡ 用户点击插队，此任务已终止'], '此任务已被新任务插队打断，未执行后续步骤。', interruptedTask.topicTitle)
           );
         }
 
@@ -969,10 +1088,10 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         const progressCard = buildCard(
           `🟡 [插队执行] 正在启动...`,
           'yellow',
-          targetTask.prompt,
+          targetTask.displayPrompt || targetTask.prompt,
           ['⚡ 已打断前序任务，新指令立刻启动！'],
           '',
-          targetTask.prompt.slice(0, 20)
+          (targetTask.displayPrompt || targetTask.prompt).slice(0, 20)
         );
 
         return {
