@@ -411,6 +411,39 @@ async function patchCard(messageId, card) {
 }
 
 // 5. 任务调度执行引擎 (支持排队与打断插队)
+// 终止指定任务的底层子进程（严格作用域绑定，避免误杀后续任务）
+function terminateTask(taskToKill) {
+  if (!taskToKill || !taskToKill.child) return;
+  taskToKill.isInterrupted = true;
+  const childProc = taskToKill.child;
+
+  let hasExited = false;
+  let killTimer = null;
+  const cleanup = () => {
+    hasExited = true;
+    if (killTimer) {
+      clearTimeout(killTimer);
+      killTimer = null;
+    }
+  };
+
+  childProc.once('close', cleanup);
+  childProc.once('exit', cleanup);
+
+  try {
+    childProc.kill('SIGTERM');
+    killTimer = setTimeout(() => {
+      try {
+        if (!hasExited) {
+          childProc.kill('SIGKILL');
+        }
+      } catch (_) {}
+    }, 1500);
+  } catch (e) {
+    console.error(`[terminateTask error] ${taskToKill.id}:`, e);
+  }
+}
+
 async function enqueueOrRun(chatId, prompt, workDir = '/root') {
   if (currentTask) {
     // 当前有正在执行的任务，压入队列并发送排队等待卡片
@@ -510,8 +543,34 @@ async function executeTask(taskItem) {
     return;
   }
 
+  const agyArgs = [];
+  if (isResuming) {
+    agyArgs.push('--conversation', activeId);
+  }
+  agyArgs.push('-p', prompt, '--output-format', 'stream-json', '--dangerously-skip-permissions');
+
+  const child = spawn(AGY_BIN, agyArgs, {
+    cwd: workDir,
+    env: { ...process.env, TERM: 'xterm-256color', HOME: '/root' }
+  });
+
+  // 记录本任务的专属句柄（闭包隔离，不受外部插队与全局状态替换影响）
+  const thisTask = {
+    id: taskItem.id,
+    child,
+    prompt,
+    chatId,
+    messageId,
+    topicTitle,
+    statusList,
+    isInterrupted: false,
+    startedAt: Date.now()
+  };
+  currentTask = thisTask;
+
   let lastPatchTime = 0;
   const throttledUpdate = async (immediate = false) => {
+    if (thisTask.isInterrupted) return;
     const now = Date.now();
     if (immediate || now - lastPatchTime > 1200) {
       lastPatchTime = now;
@@ -527,34 +586,11 @@ async function executeTask(taskItem) {
     }
   };
 
-  const agyArgs = [];
-  if (isResuming) {
-    agyArgs.push('--conversation', activeId);
-  }
-  agyArgs.push('-p', prompt, '--output-format', 'stream-json', '--dangerously-skip-permissions');
-
-  const child = spawn(AGY_BIN, agyArgs, {
-    cwd: workDir,
-    env: { ...process.env, TERM: 'xterm-256color', HOME: '/root' }
-  });
-
-  // 记录为全局当前活跃任务
-  currentTask = {
-    id: taskItem.id,
-    child,
-    prompt,
-    chatId,
-    messageId,
-    topicTitle,
-    statusList,
-    isInterrupted: false,
-    startedAt: Date.now()
-  };
-
   const rl = readline.createInterface({ input: child.stdout });
   let detectedConversationId = null;
 
   rl.on('line', (line) => {
+    if (thisTask.isInterrupted) return;
     line = line.trim();
     if (!line) return;
 
@@ -599,15 +635,21 @@ async function executeTask(taskItem) {
   });
 
   child.on('close', async (code, signal) => {
-    console.log(`[Task Closed] code: ${code}, signal: ${signal}, conversationId: ${detectedConversationId}`);
+    console.log(`[Task Closed] id: ${thisTask.id}, code: ${code}, signal: ${signal}, conversationId: ${detectedConversationId}`);
 
-    const taskRef = currentTask;
-    currentTask = null;
-
-    if (taskRef && taskRef.isInterrupted) {
-      console.log(`[Task Interrupted Ignored Close] ${taskRef.id}`);
-      checkAndRunNext();
+    // 如果本任务已被外部打断（例如被插队或/stop），卡片已就绪，直接跳过并清理
+    if (thisTask.isInterrupted) {
+      console.log(`[Task Interrupted Ignored Close] ${thisTask.id}`);
+      if (currentTask === thisTask) {
+        currentTask = null;
+        checkAndRunNext();
+      }
       return;
+    }
+
+    // 只有当全局 currentTask 确实指向本任务时才置空，绝不误清除后续任务
+    if (currentTask === thisTask) {
+      currentTask = null;
     }
 
     statusList.push(code === 0 ? '🏁 任务处理完成！' : `⚠️ 异常退出码: ${code || signal}`);
@@ -686,19 +728,14 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         }
 
         if (currentTask) {
-          currentTask.isInterrupted = true;
-          try {
-            currentTask.child.kill('SIGTERM');
-            setTimeout(() => {
-              try { currentTask?.child?.kill('SIGKILL'); } catch (_) {}
-            }, 1500);
-          } catch (_) {}
+          const taskToStop = currentTask;
+          currentTask = null;
+          terminateTask(taskToStop);
 
           await patchCard(
-            currentTask.messageId,
-            buildCard('⏹️ [已手动停止] 任务已终止', 'grey', currentTask.prompt, [...currentTask.statusList, '🛑 用户发送了 /stop 终止指令'], '任务已被手动终止。', currentTask.topicTitle)
+            taskToStop.messageId,
+            buildCard('⏹️ [已手动停止] 任务已终止', 'grey', taskToStop.prompt, [...taskToStop.statusList, '🛑 用户发送了 /stop 终止指令'], '任务已被手动终止。', taskToStop.topicTitle)
           );
-          currentTask = null;
         }
 
         if (taskQueue.length > 0) {
@@ -916,19 +953,14 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
 
         // 打断当前正在运行的任务
         if (currentTask) {
-          currentTask.isInterrupted = true;
-          try {
-            currentTask.child.kill('SIGTERM');
-            setTimeout(() => {
-              try { currentTask?.child?.kill('SIGKILL'); } catch (_) {}
-            }, 1500);
-          } catch (_) {}
+          const interruptedTask = currentTask;
+          currentTask = null;
+          terminateTask(interruptedTask);
 
           await patchCard(
-            currentTask.messageId,
-            buildCard('⚠️ [已打断] 任务被新指令插队', 'grey', currentTask.prompt, [...currentTask.statusList, '⚡ 用户点击插队，此任务已终止'], '此任务已被新任务插队打断，未执行后续步骤。', currentTask.topicTitle)
+            interruptedTask.messageId,
+            buildCard('⚠️ [已打断] 任务被新指令插队', 'grey', interruptedTask.prompt, [...interruptedTask.statusList, '⚡ 用户点击插队，此任务已终止'], '此任务已被新任务插队打断，未执行后续步骤。', interruptedTask.topicTitle)
           );
-          currentTask = null;
         }
 
         // 立即启动这个插队的任务
