@@ -293,12 +293,22 @@ function formatForFeishu(text) {
 }
 
 // 4. 构建任务进度/结果卡片
+function formatPromptCodeBlock(text, maxLength = 300) {
+  if (!text) return '```text\n(空)\n```';
+  let cleanText = text;
+  if (cleanText.length > maxLength) {
+    cleanText = cleanText.slice(0, maxLength) + '...';
+  }
+  cleanText = cleanText.replace(/```/g, '` ` `');
+  return `\`\`\`text\n${cleanText}\n\`\`\``;
+}
+
 function buildCard(title, template, prompt, statusList, resultText = '', topicTitle = '') {
-  const promptDisplay = prompt.length > 100 ? prompt.slice(0, 100) + '...' : prompt;
+  const promptCodeBlock = formatPromptCodeBlock(prompt, 300);
   const elements = [
     {
       tag: 'markdown',
-      content: `${topicTitle ? `🏷️ **当前主题**：\`${topicTitle}\`\n\n` : ''}**📋 本轮指令**：\n> ${promptDisplay.replace(/\n/g, '\n> ')}`
+      content: `${topicTitle ? `🏷️ **当前主题**：\`${topicTitle}\`\n\n` : ''}**📋 本轮指令**：\n${promptCodeBlock}`
     },
     { tag: 'hr' }
   ];
@@ -334,8 +344,9 @@ function buildCard(title, template, prompt, statusList, resultText = '', topicTi
 
 // 构建排队卡片 (包含打断插队与取消排队按钮)
 function buildQueueCard(runningPrompt, queuedPrompt, queuePos, queueId) {
-  const displayRunning = runningPrompt.length > 50 ? runningPrompt.slice(0, 50) + '...' : runningPrompt;
-  const displayQueued = queuedPrompt.length > 100 ? queuedPrompt.slice(0, 100) + '...' : queuedPrompt;
+  const displayRunning = (runningPrompt || '').length > 50 ? (runningPrompt || '').slice(0, 50) + '...' : (runningPrompt || '');
+  const safeRunning = displayRunning.replace(/`/g, "'");
+  const queuedCodeBlock = formatPromptCodeBlock(queuedPrompt, 200);
   return {
     config: { wide_screen_mode: true },
     header: {
@@ -345,7 +356,7 @@ function buildQueueCard(runningPrompt, queuedPrompt, queuePos, queueId) {
     elements: [
       {
         tag: 'markdown',
-        content: `**📋 你的待办指令**：\n> ${displayQueued.replace(/\n/g, '\n> ')}\n\n⚠️ **当前正忙**：正在执行【\`${displayRunning}\`】\n*排队等待中，前序任务结束后将自动开始本任务。*`
+        content: `**📋 你的待办指令**：\n${queuedCodeBlock}\n⚠️ **当前正忙**：正在执行【\`${safeRunning}\`】\n*排队等待中，前序任务结束后将自动开始本任务。*`
       },
       { tag: 'hr' },
       {
