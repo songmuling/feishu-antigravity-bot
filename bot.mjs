@@ -293,6 +293,8 @@ function formatForFeishu(text) {
 }
 
 // 4. 构建任务进度/结果卡片
+const CARD_TEXT_LIMIT = 25000; // 飞书单卡片安全容量上限（实测支持至 25000~30000 字符）
+
 function formatPromptCodeBlock(text, maxLength = 300) {
   if (!text) return '```text\n(空)\n```';
   let cleanText = text;
@@ -323,8 +325,8 @@ function buildCard(title, template, prompt, statusList, resultText = '', topicTi
   if (resultText) {
     elements.push({ tag: 'hr' });
     const formatted = formatForFeishu(resultText);
-    const displayContent = formatted.length > 4000 
-      ? formatted.slice(0, 4000) + '\n\n*(内容较长已在手机端适度截断)*'
+    const displayContent = formatted.length > CARD_TEXT_LIMIT 
+      ? formatted.slice(0, CARD_TEXT_LIMIT) + '\n\n*(内容极长已达单张卡片上限，超长部分已自动续发后续卡片)*'
       : formatted;
     elements.push({
       tag: 'markdown',
@@ -732,6 +734,46 @@ async function executeTask(taskItem) {
     );
 
     await patchCard(messageId, finalCard);
+
+    // 超过 25,000 字符的超长内容，自动以续发卡片在同一会话中推送，确保 100% 永不丢字！
+    const formattedFull = formatForFeishu(finalResponse);
+    if (code === 0 && formattedFull.length > CARD_TEXT_LIMIT) {
+      let remaining = formattedFull.slice(CARD_TEXT_LIMIT);
+      let partIdx = 2;
+      while (remaining.length > 0) {
+        const chunk = remaining.slice(0, CARD_TEXT_LIMIT);
+        remaining = remaining.slice(CARD_TEXT_LIMIT);
+
+        const continuationCard = {
+          config: { wide_screen_mode: true },
+          header: {
+            template: 'blue',
+            title: { tag: 'plain_text', content: `📑 [${topicTitle}] (续篇 ${partIdx})` }
+          },
+          elements: [
+            {
+              tag: 'markdown',
+              content: chunk
+            }
+          ]
+        };
+
+        try {
+          await client.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'interactive',
+              content: JSON.stringify(continuationCard)
+            }
+          });
+          console.log(`[Continuation Message Sent] Part ${partIdx} for ${thisTask.id}`);
+        } catch (err) {
+          console.error(`[Continuation Message Failed] Part ${partIdx}:`, err.message);
+        }
+        partIdx++;
+      }
+    }
 
     // 检查并调度队列中的下一个任务
     checkAndRunNext();
