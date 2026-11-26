@@ -289,6 +289,12 @@ function formatForFeishu(text) {
     res = res.replace(`___CODE_BLOCK_${idx}___`, () => code);
   });
 
+  // 5. 将非 http/https 协议链接（如 [index.html](ssh://KR)）还原为可读文本，避免飞书客户端协议校验异常
+  res = res.replace(/\[([^\]]+)\]\((?!(?:https?:\/\/))([^)]+)\)/g, '$1 ($2)');
+
+  // 6. 替换 HTML/XML 标签中的 < 与 > 为全角 ＜ 与 ＞，防止飞书手机端将其误判为原生富文本节点导致 AST 错位与内容丢失
+  res = res.replace(/<(?!at\s|\/at>|https?:\/\/|http:\/\/)(\/?[a-zA-Z!][^>\n]*?)>/g, '＜$1＞');
+
   return res;
 }
 
